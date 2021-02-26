@@ -257,3 +257,7 @@ paket-files/
 
 # Visual Studio Code
 .vscode
+
+CASCHost/*.db3
+CASCHost/listfile.csv
+HttpProxy/logs/

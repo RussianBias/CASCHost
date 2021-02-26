@@ -1,4 +1,5 @@
 ﻿using CASCEdit;
+using CASCEdit.Configs;
 using CASCEdit.Structs;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Logging;
@@ -22,23 +23,24 @@ namespace CASCHost
 
 		private IHostingEnvironment _env;
 		private FileSystemWatcher watcher;
+		private FileSystemWatcher gameDirectoryWatcher;
 		private Timer timer;
 		private readonly string dataPath;
 		private readonly string outputPath;
+		private readonly string buildInfoPath;
 		private ConcurrentDictionary<string, FileSystemEventArgs> changes;
 		private CASSettings settings;
-		private DateTime lastBuild;
-
 
         public DataWatcher(IHostingEnvironment env)
 		{
 			_env = env;
-			dataPath = Path.Combine(env.WebRootPath, "Data");
-			outputPath = Path.Combine(env.WebRootPath, "Output");
+			dataPath = Path.Combine(env.WebRootPath, "Data", Startup.Settings.Product);
+			outputPath = Path.Combine(env.WebRootPath, "Output", Startup.Settings.Product);
+            buildInfoPath = Path.Combine(env.WebRootPath, "SystemFiles");
             changes = new ConcurrentDictionary<string, FileSystemEventArgs>();
-            lastBuild = new DateTime();
 
-			LoadSettings();
+
+            LoadSettings();
             if (settings.StaticMode)
             {
                 ForceRebuild();
@@ -46,14 +48,21 @@ namespace CASCHost
             }
 
             //Rebuild if files have changed since last run otherwise wait for a change to occur
-            if (!IsRebuildRequired())
-				timer = new Timer(UpdateCASCDirectory, null, Timeout.Infinite, Timeout.Infinite);
+            if (IsRebuildRequired())
+            {
+                ForceRebuild();
+            }
+            else
+            {
+                timer = new Timer(UpdateCASCDirectory, null, Timeout.Infinite, Timeout.Infinite);
+            }
+				
 
             watcher = new FileSystemWatcher()
 			{
 				Path = dataPath,
 				NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.CreationTime,
-				EnableRaisingEvents = false /*Startup.Settings.RebuildOnChange*/,
+				EnableRaisingEvents = false,
 				IncludeSubdirectories = true
 			};
 
@@ -61,28 +70,58 @@ namespace CASCHost
 			watcher.Created += LogChange;
 			watcher.Deleted += LogChange;
 			watcher.Renamed += LogChange;
+
+            gameDirectoryWatcher = new FileSystemWatcher()
+            {
+                Path = Startup.Settings.GameDirectory,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+                EnableRaisingEvents = true,
+                IncludeSubdirectories = false
+            };
+
+            gameDirectoryWatcher.Changed += onGameDirectoryChange;
+            gameDirectoryWatcher.Created += onGameDirectoryChange;
         }
 
+        #region Change Detection
 
-		#region Change Detection
-		private void LogChange(object sender, FileSystemEventArgs e)
-		{
-			//Ignore folder changes - rename is handled below all files fire this event themselves
-			if (IsDirectory(e.FullPath))
-				return;
+        private void onGameDirectoryChange(object sender, FileSystemEventArgs e)
+        {
+            //Ignore folder changes
+            if (IsDirectory(e.FullPath))
+                return;
 
-			//Assume anything extensionless is a folder
-			if (string.IsNullOrWhiteSpace(Path.GetExtension(e.FullPath)))
-				return;
+  
+            if (e.Name == ".build.info" && File.Exists(e.FullPath))
+            {
+                Startup.Logger.LogInformation($".build.info changes detected. Updating...");
+                Startup.ImportBuildInfo(Path.Combine(buildInfoPath, ".build.info"));
+
+                if (!RebuildInProgress && IsRebuildRequired())
+                    ForceRebuild();
+
+                return;
+            }
+        }
+
+        private void LogChange(object sender, FileSystemEventArgs e)
+        {
+            //Ignore folder changes - rename is handled below all files fire this event themselves
+            if (IsDirectory(e.FullPath))
+                return;
+
+            //Assume anything extensionless is a folder
+            if (string.IsNullOrWhiteSpace(Path.GetExtension(e.FullPath)))
+                return;
 
             //Update or add change
             changes.AddOrUpdate(e.FullPath, e, (k, v) => e);
 
             //Add delay for user to finishing changing files
             timer.Change(30 * 1000, 0);
-		}
+        }
 
-		private void LogChange(object sender, RenamedEventArgs e)
+        private void LogChange(object sender, RenamedEventArgs e)
 		{
 			if (IsDirectory(e.FullPath))
 			{
@@ -113,21 +152,33 @@ namespace CASCHost
 		#region CASC Update
 		public void ForceRebuild()
 		{
+            //Wipe DB
+            Startup.Cache.wipeDB();
+
+            //Wipe CASC
+            WipeCASCDirectory();
+
+            changes.Clear();
+
             //Rebuild all files
             var files = Directory.EnumerateFiles(dataPath, "*.*", SearchOption.AllDirectories).OrderBy(f => f);
             foreach (var f in files)
 			{
-				if(File.GetLastWriteTime(f) >= lastBuild || File.GetCreationTime(f) >= lastBuild)
-				{
-					var args = new FileSystemEventArgs(WatcherChangeTypes.Changed, Path.GetDirectoryName(f), Path.GetFileName(f));
-                    changes.AddOrUpdate(f, args, (k, v) => args);
-                }
+                var args = new FileSystemEventArgs(WatcherChangeTypes.Changed, Path.GetDirectoryName(f), Path.GetFileName(f));
+                changes.AddOrUpdate(f, args, (k, v) => args);
             }
 
             timer = new Timer(UpdateCASCDirectory, null, 0, Timeout.Infinite);
 		}
 
-		private void UpdateCASCDirectory(object obj)
+        private void WipeCASCDirectory()
+        {
+            Directory.Delete(outputPath, true);
+            Directory.CreateDirectory(outputPath);
+        }
+
+
+        private void UpdateCASCDirectory(object obj)
 		{
 			if (RebuildInProgress) //Saving already wait for build to finish
 			{
@@ -168,6 +219,7 @@ namespace CASCHost
 					string cascpath = GetCASCPath(fullpath);
 					string oldpath = GetCASCPath((change as RenamedEventArgs)?.OldFullPath + "");
 
+
 					switch (change.ChangeType)
 					{
 						case WatcherChangeTypes.Renamed:
@@ -195,7 +247,12 @@ namespace CASCHost
 				GetDirectoryHash(dataPath),
 				GetDirectoryHash(outputPath)
 			};
-			Startup.Settings.Save(_env);
+
+            string GameVersion = new SingleConfig(Path.Combine(buildInfoPath, ".build.info"), "Active", "1", Startup.Settings.Product)["Version"];
+            Startup.Settings.GameVersion = GameVersion;
+
+
+            Startup.Settings.Save(_env);
 
 			sw.Stop();
 			Startup.Logger.LogWarning($"CASC rebuild finished [{DateTime.Now}] - {Math.Round(sw.Elapsed.TotalSeconds, 3)}s");
@@ -205,7 +262,6 @@ namespace CASCHost
                 Environment.Exit(0);
             }
 
-            lastBuild = DateTime.Now;
 			RebuildInProgress = false;
 		}
 
@@ -213,7 +269,7 @@ namespace CASCHost
 		{
 			string lookup = new DirectoryInfo(_env.WebRootPath).Name;
 			string[] parts = file.Split(Path.DirectorySeparatorChar);
-			return Path.Combine(parts.Skip(Array.IndexOf(parts, lookup) + 2).ToArray()); //Remove top directories
+			return Path.Combine(parts.Skip(Array.IndexOf(parts, lookup) + 3).ToArray()); //Remove top directories
 		}
 		#endregion
 
@@ -222,8 +278,19 @@ namespace CASCHost
 		{
 			Startup.Logger.LogInformation("Offline file change check.");
 
-			//No data files
-			if (!Directory.EnumerateFiles(dataPath, "*.*", SearchOption.AllDirectories).Any())
+            string BuildInfoVersion = new SingleConfig(Path.Combine(buildInfoPath, ".build.info"), "Active", "1", Startup.Settings.Product)["Version"];
+            if (BuildInfoVersion != Startup.Settings.GameVersion)
+            {
+                Startup.Logger.LogInformation($"New version detected: {BuildInfoVersion}. Rebuilding...");
+                return true;
+            }
+            else
+            {
+                Startup.Logger.LogInformation($"Same version, nothing to do here.");
+            }
+
+            //No data files
+            if (!Directory.EnumerateFiles(dataPath, "*.*", SearchOption.AllDirectories).Any())
 				return false;
 
 			string[] hashes = new[]
@@ -235,7 +302,6 @@ namespace CASCHost
 			//Check for offline changes
 			if (!hashes.SequenceEqual(Startup.Settings.DirectoryHash) /*|| Startup.Settings.RebuildOnLoad*/)
 			{
-				ForceRebuild();
 				return true;
 			}
 
@@ -269,14 +335,16 @@ namespace CASCHost
 			{
 				Host = Startup.Settings.HostDomain,
 				BasePath = _env.WebRootPath,
-				OutputPath = "Output",
-				SystemFilesPath = "SystemFiles",
+				OutputPath = Path.Combine("Output", Startup.Settings.Product),
+				SystemFilesPath = Path.Combine("SystemFiles", Startup.Settings.Product),
+				BuildInfoPath = this.buildInfoPath,
 				PatchUrl = Startup.Settings.PatchUrl,
 				Logger = Startup.Logger,
 				Cache = Startup.Cache,
 				Locale = locale,
 				CDNs = new HashSet<string>(),
-                StaticMode = Startup.Settings.StaticMode
+                StaticMode = Startup.Settings.StaticMode,
+                Product = Startup.Settings.Product
             };
 
 
@@ -303,6 +371,9 @@ namespace CASCHost
 			timer = null;
 			watcher?.Dispose();
 			watcher = null;
-		}
+            gameDirectoryWatcher?.Dispose();
+            gameDirectoryWatcher = null;
+
+        }
 	}
 }

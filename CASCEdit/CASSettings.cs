@@ -15,6 +15,7 @@ namespace CASCEdit
         public bool Basic { get; set; } = false;
         public string BasePath { get; set; }
         public string SystemFilesPath { get; set; }
+        public string BuildInfoPath { get; set; }
         public string OutputPath { get; set; }
         public string PatchUrl { get; set; }        
         public string Host { get; set; }
@@ -23,6 +24,7 @@ namespace CASCEdit
 		public LocaleFlags Locale { get; set; } = LocaleFlags.enUS;
         public bool StaticMode { get; set; } = false;
 
+        public string Product { get; set; }
 
         public HashSet<string> DownloadLocations { get; set; }
 		public HashSet<string> CDNs { get; set; }
@@ -38,6 +40,9 @@ namespace CASCEdit
                 SystemFilesPath = BasePath;
             else if (!Directory.Exists(SystemFilesPath))
                 SystemFilesPath = Path.Combine(BasePath, SystemFilesPath);
+
+            if (!Directory.Exists(BuildInfoPath))
+                BuildInfoPath = Path.Combine(BasePath, BuildInfoPath);
         }
     }
 }
